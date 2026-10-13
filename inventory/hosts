@@ -1,0 +1,4 @@
+# One VM. Change IP / MAC / sizing to suit. Hostname = inventory name.
+# cpu = vCPUs, ram = GiB, disk = GiB (root disk, grown from the base image)
+[vaultvms]
+vault ansible_host=192.168.1.236 mac=00:16:3e:25:1a:80 cpu=2 ram=8 disk=50

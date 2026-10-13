@@ -1,0 +1,28 @@
+# --- Network (same values as cephlibvirt) ---
+domain: "local.labmesh.org"
+dns: "192.168.1.150"
+gateway: "192.168.1.1"
+prefix: 24
+bridge_name: "br0"
+
+# --- Host-side storage ---
+# Directory backing your libvirt pool (virsh pool-dumpxml <pool> | grep path)
+libvirt_pool_name: "SSD1_VMs"
+libvirt_pool_dir: "/ssd1/VMs"
+# Base cloud image (RHEL 9 KVM guest image). Copied once into the pool, then each VM gets an overlay.
+qcow_source: "/home/momo/rhel-9.6-x86_64-kvm.qcow2"
+base_image_name: "rhel9-base.qcow2"
+# osinfo name for virt-install (list with: virt-install --osinfo list | grep rhel9)
+vm_osinfo: "rhel9.6"
+# Where the cloud-init seed files are rendered on the hypervisor
+workdir: "/ssd1/workdir/vault"
+
+# --- Guest access ---
+vm_username: "vault-admin" # SSH user created by cloud-init (matches ansible.cfg remote_user)
+mypassword: "{{ lookup('file', '~/mypassword') }}" # Hash: openssl passwd -6 'mysecretpassword'
+mysshkey: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+
+# --- Used in step 3 (OS update) ---
+rhel_release: "9.6"
+myac: "{{ lookup('file', '~/activationkey') }}"
+myorg: "{{ lookup('file', '~/organization') }}"

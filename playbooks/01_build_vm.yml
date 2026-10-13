@@ -1,0 +1,118 @@
+---
+# Step 1: build the Vault VM on the local libvirt host with virt-install + cloud-init.
+# Run:  ansible-playbook playbooks/01_build_vm.yml   (add -K if your sudo needs a password)
+
+- name: Build Vault VM on the hypervisor
+  hosts: vaultvms
+  connection: local
+  gather_facts: false
+  become: true
+  vars:
+    vm_disk: "{{ libvirt_pool_dir }}/{{ inventory_hostname }}-root.qcow2"
+    base_disk: "{{ libvirt_pool_dir }}/{{ base_image_name }}"
+    seed_dir: "{{ workdir }}/{{ inventory_hostname }}"
+  tasks:
+    - name: Check whether the VM already exists
+      ansible.builtin.command: virsh -c qemu:///system dominfo {{ inventory_hostname }}
+      register: dominfo
+      changed_when: false
+      failed_when: false
+
+    - name: Stop here if the VM already exists (run 99_destroy_vm.yml to rebuild)
+      ansible.builtin.debug:
+        msg: "VM {{ inventory_hostname }} already exists - skipping build."
+      when: dominfo.rc == 0
+
+    - name: Build block
+      when: dominfo.rc != 0
+      block:
+        - name: Create seed directory
+          ansible.builtin.file:
+            path: "{{ seed_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Copy base image into the pool (once)
+          ansible.builtin.copy:
+            src: "{{ qcow_source }}"
+            dest: "{{ base_disk }}"
+            remote_src: true
+            force: false
+            mode: "0644"
+
+        - name: Create root disk as an overlay on the base image
+          ansible.builtin.command: >
+            qemu-img create -f qcow2 -F qcow2
+            -b {{ base_disk }} {{ vm_disk }} {{ disk }}G
+          args:
+            creates: "{{ vm_disk }}"
+
+        - name: Render cloud-init seed files
+          ansible.builtin.template:
+            src: "../templates/{{ item }}.j2"
+            dest: "{{ seed_dir }}/{{ item }}"
+            mode: "0600"
+          loop:
+            - user-data
+            - meta-data
+            - network-config
+
+        - name: Create and start the VM
+          ansible.builtin.command: >
+            virt-install
+            --connect qemu:///system
+            --name {{ inventory_hostname }}
+            --memory {{ ram | int * 1024 }}
+            --vcpus {{ cpu }}
+            --cpu host-passthrough
+            --os-variant {{ vm_osinfo }}
+            --import
+            --disk path={{ vm_disk }},format=qcow2,bus=virtio
+            --network bridge={{ bridge_name }},mac={{ mac }},model=virtio
+            --cloud-init user-data={{ seed_dir }}/user-data,meta-data={{ seed_dir }}/meta-data,network-config={{ seed_dir }}/network-config
+            --graphics none
+            --console pty,target_type=serial
+            --autostart
+            --noautoconsole
+          changed_when: true
+
+        - name: Refresh the storage pool so virsh sees the new disk
+          ansible.builtin.command: virsh -c qemu:///system pool-refresh {{ libvirt_pool_name }}
+          changed_when: false
+          failed_when: false
+
+    - name: Wait for SSH on {{ ansible_host }}
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        delay: 10
+        timeout: 600
+      become: false
+
+- name: Verify the VM is reachable and configured
+  hosts: vaultvms
+  gather_facts: true
+  tasks:
+    - name: Wait until Ansible can log in
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+
+    - name: Show what the VM reports
+      ansible.builtin.debug:
+        msg:
+          - "Hostname : {{ ansible_fqdn }}"
+          - "IP       : {{ ansible_default_ipv4.address | default('none') }}"
+          - "Gateway  : {{ ansible_default_ipv4.gateway | default('none') }}"
+          - "OS       : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "vCPU/RAM : {{ ansible_processor_vcpus }} / {{ ansible_memtotal_mb }} MB"
+          - "Root size: {{ (ansible_mounts | selectattr('mount', 'equalto', '/') | first).size_total | human_readable }}"
+
+    - name: Fail if the IP is not what the inventory says
+      ansible.builtin.assert:
+        that: ansible_default_ipv4.address == ansible_host
+        fail_msg: "VM has {{ ansible_default_ipv4.address | default('no IP') }}, expected {{ ansible_host }}"
+        success_msg: "IP matches inventory"
