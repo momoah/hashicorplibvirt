@@ -11,6 +11,7 @@
     vm_disk: "{{ libvirt_pool_dir }}/{{ inventory_hostname }}-root.qcow2"
     base_disk: "{{ libvirt_pool_dir }}/{{ base_image_name }}"
     seed_dir: "{{ workdir }}/{{ inventory_hostname }}"
+    seed_iso: "{{ libvirt_pool_dir }}/{{ inventory_hostname }}-cidata.iso"
   tasks:
     - name: Check whether the VM already exists
       ansible.builtin.command: virsh -c qemu:///system dominfo {{ inventory_hostname }}
@@ -26,6 +27,11 @@
     - name: Build block
       when: dominfo.rc != 0
       block:
+        - name: Ensure ISO tool is installed on the hypervisor
+          ansible.builtin.dnf:
+            name: xorriso
+            state: present
+
         - name: Create seed directory
           ansible.builtin.file:
             path: "{{ seed_dir }}"
@@ -57,6 +63,13 @@
             - meta-data
             - network-config
 
+        - name: Build cloud-init seed ISO (volume label must be 'cidata')
+          ansible.builtin.command: >
+            xorriso -as mkisofs -output {{ seed_iso }}
+            -volid cidata -joliet -rock
+            {{ seed_dir }}/user-data {{ seed_dir }}/meta-data {{ seed_dir }}/network-config
+          changed_when: true
+
         - name: Create and start the VM
           ansible.builtin.command: >
             virt-install
@@ -68,8 +81,8 @@
             --os-variant {{ vm_osinfo }}
             --import
             --disk path={{ vm_disk }},format=qcow2,bus=virtio
-            --network bridge={{ bridge_name }},mac={{ mac }},model=virtio
-            --cloud-init user-data={{ seed_dir }}/user-data,meta-data={{ seed_dir }}/meta-data,network-config={{ seed_dir }}/network-config
+            --network network={{ libvirt_network }},mac={{ mac }},model=virtio
+            --disk path={{ seed_iso }},device=cdrom
             --graphics none
             --console pty,target_type=serial
             --autostart

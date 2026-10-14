@@ -4,6 +4,14 @@ fqdn: {{ inventory_hostname }}.{{ domain }}
 prefer_fqdn_over_hostname: true
 ssh_pwauth: true
 
+# Console fallback: same hash as the admin user
+chpasswd:
+  expire: false
+  users:
+    - name: root
+      password: "{{ mypassword }}"
+      type: hash
+
 users:
   - name: {{ vm_username }}
     passwd: "{{ mypassword }}"
