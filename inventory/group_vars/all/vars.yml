@@ -21,10 +21,25 @@ workdir: "/ssd1/workdir/vault"
 # --- Guest access ---
 vm_username: "admin" # SSH user created by cloud-init (matches ansible.cfg remote_user)
 ansible_user: "{{ vm_username }}"
-mypassword: "{{ lookup('file', '~/mypassword') }}" # Hash: openssl passwd -6 'mysecretpassword'
+mypassword: "{{ lookup('file', '~/mypassword') }}" # openssl passwd -6 > ~/mypassword           
 mysshkey: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
 
 # --- Used in step 3 (OS update) ---
-rhel_release: "9.6"
+rhel_release: "9.8"
 myac: "{{ lookup('file', '~/activationkey') }}"
 myorg: "{{ lookup('file', '~/organization') }}"
+
+# --- Vault ---
+vault_version: "2.1.2"
+vault_port: 8200
+vault_cluster_port: 8201
+vault_tls_dir: "/opt/vault/tls"
+# Wildcard *.local.labmesh.org cert (same files cephlibvirt uses). fullchain = leaf first, then CA.
+vault_tls_cert_src: "~/cephcerts/fullchain.pem"
+vault_tls_key_src: "~/cephcerts/key.pem"
+# Lab setting: 1 key, 1 to unseal. Use 5/3 for anything real.
+vault_key_shares: 1
+vault_key_threshold: 1
+# Unseal keys + root token are written here on the controller (never commit this file)
+vault_init_file: "{{ lookup('env', 'HOME') }}/vault-init.json"
+

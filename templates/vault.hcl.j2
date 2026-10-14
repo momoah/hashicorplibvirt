@@ -1,0 +1,18 @@
+# Managed by Ansible (04_configure_vault.yml) - local edits will be overwritten
+ui            = true
+disable_mlock = true   # Recommended with integrated (raft) storage
+
+api_addr     = "https://{{ vault_fqdn }}:{{ vault_port }}"
+cluster_addr = "https://{{ vault_fqdn }}:{{ vault_cluster_port }}"
+
+storage "raft" {
+  path    = "/opt/vault/data"
+  node_id = "{{ inventory_hostname }}"
+}
+
+listener "tcp" {
+  address         = "0.0.0.0:{{ vault_port }}"
+  cluster_address = "0.0.0.0:{{ vault_cluster_port }}"
+  tls_cert_file   = "{{ vault_tls_dir }}/vault-fullchain.pem"
+  tls_key_file    = "{{ vault_tls_dir }}/vault-key.pem"
+}

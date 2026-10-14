@@ -1,0 +1,74 @@
+---
+# Step 3: add the HashiCorp RPM repo, install a pinned Vault version, lock it.
+# Vault is NOT configured or started here - that is step 4 (04_configure_vault.yml).
+# Run:  ansible-playbook playbooks/03_install_vault.yml
+
+- name: Install HashiCorp Vault (community edition)
+  hosts: vaultvms
+  become: true
+  tasks:
+    - name: Add the HashiCorp repo file (official location)
+      ansible.builtin.get_url:
+        url: https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
+        dest: /etc/yum.repos.d/hashicorp.repo
+        mode: "0644"
+
+    - name: Pin repo path to the major version (avoid $releasever=9.8 from the RHSM release lock)
+      ansible.builtin.replace:
+        path: /etc/yum.repos.d/hashicorp.repo
+        regexp: '\$releasever'
+        replace: "{{ ansible_distribution_major_version }}"
+
+    - name: Check the requested version is in the repo
+      ansible.builtin.command: >
+        dnf --disablerepo='*' --enablerepo='hashicorp' -q
+        list --showduplicates --available vault-{{ vault_version }}
+      register: vault_avail
+      changed_when: false
+      failed_when: false
+
+    - name: Stop if vault-{{ vault_version }} is not available
+      ansible.builtin.assert:
+        that: vault_avail.rc == 0
+        fail_msg: "vault-{{ vault_version }} not found in the HashiCorp repo. Output: {{ vault_avail.stderr | default('') }}"
+        success_msg: "vault-{{ vault_version }} found in repo"
+
+    - name: Install versionlock plugin
+      ansible.builtin.dnf:
+        name: python3-dnf-plugin-versionlock
+        state: present
+
+    - name: Install vault-{{ vault_version }}
+      ansible.builtin.dnf:
+        name: "vault-{{ vault_version }}"
+        state: present
+
+    - name: Lock Vault at this version (upgrade later by changing vault_version)
+      community.general.dnf_versionlock:
+        name: "vault-{{ vault_version }}"
+        state: present
+
+    - name: Read installed Vault version
+      ansible.builtin.command: vault version
+      register: vault_ver
+      changed_when: false
+
+    - name: Show what the RPM installed
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /usr/bin/vault
+        - /etc/vault.d/vault.hcl
+        - /usr/lib/systemd/system/vault.service
+        - /opt/vault/data
+      register: vault_files
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "{{ [vault_ver.stdout] + (vault_files.results | map(attribute='item') | zip(vault_files.results | map(attribute='stat.exists')) | map('join', ' present=') | list) }}"
+
+    - name: Fail if the wrong version is installed
+      ansible.builtin.assert:
+        that: ("v" ~ vault_version) in vault_ver.stdout
+        fail_msg: "Expected v{{ vault_version }}, got: {{ vault_ver.stdout }}"
+        success_msg: "Vault v{{ vault_version }} installed"

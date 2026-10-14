@@ -1,0 +1,176 @@
+---
+# Step 4: configure Vault (raft storage + TLS), start it, initialise once, unseal, enable KV v2.
+# Safe to re-run. After a VM reboot Vault comes up sealed - re-run this playbook to unseal it.
+# Run:  ansible-playbook playbooks/04_configure_vault.yml
+
+- name: Configure and initialise Vault
+  hosts: vaultvms
+  become: true
+  vars:
+    vault_fqdn: "{{ inventory_hostname }}.{{ domain }}"
+    vault_env:
+      VAULT_ADDR: "https://{{ vault_fqdn }}:{{ vault_port }}"
+  handlers:
+    - name: Restart vault
+      ansible.builtin.systemd_service:
+        name: vault
+        state: restarted
+
+  tasks:
+    # ---------- Config, TLS, firewall ----------
+    - name: Create TLS directory
+      ansible.builtin.file:
+        path: "{{ vault_tls_dir }}"
+        state: directory
+        owner: vault
+        group: vault
+        mode: "0750"
+
+    - name: Install TLS certificate (leaf first, then CA chain)
+      ansible.builtin.copy:
+        content: "{{ lookup('file', vault_tls_cert_src) }}\n"
+        dest: "{{ vault_tls_dir }}/vault-fullchain.pem"
+        owner: vault
+        group: vault
+        mode: "0644"
+      notify: Restart vault
+
+    - name: Install TLS private key
+      ansible.builtin.copy:
+        content: "{{ lookup('file', vault_tls_key_src) }}\n"
+        dest: "{{ vault_tls_dir }}/vault-key.pem"
+        owner: vault
+        group: vault
+        mode: "0600"
+      no_log: true
+      notify: Restart vault
+
+    - name: Write /etc/vault.d/vault.hcl (original kept as a backup)
+      ansible.builtin.template:
+        src: ../templates/vault.hcl.j2
+        dest: /etc/vault.d/vault.hcl
+        owner: vault
+        group: vault
+        mode: "0640"
+        backup: true
+      notify: Restart vault
+
+    - name: Open Vault API port in firewalld
+      ansible.posix.firewalld:
+        port: "{{ vault_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Enable and start vault
+      ansible.builtin.systemd_service:
+        name: vault
+        enabled: true
+        state: started
+
+    - name: Apply any pending restart now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the API port
+      ansible.builtin.wait_for:
+        port: "{{ vault_port }}"
+        timeout: 60
+
+    # ---------- Initialise (first run only) ----------
+    - name: Get Vault status (rc 0 = unsealed, 2 = sealed, 1 = error)
+      ansible.builtin.command: vault status -format=json
+      environment: "{{ vault_env }}"
+      register: st
+      changed_when: false
+      failed_when: st.rc == 1
+
+    - name: Initialise Vault
+      ansible.builtin.command: >
+        vault operator init -format=json
+        -key-shares={{ vault_key_shares }}
+        -key-threshold={{ vault_key_threshold }}
+      environment: "{{ vault_env }}"
+      register: init_out
+      when: not (st.stdout | from_json).initialized
+      no_log: true
+
+    - name: Save unseal keys + root token on the controller (mode 0600)
+      ansible.builtin.copy:
+        content: "{{ init_out.stdout }}\n"
+        dest: "{{ vault_init_file }}"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      when: init_out is changed
+      no_log: true
+
+    # ---------- Unseal ----------
+    - name: Load keys from {{ vault_init_file }}
+      ansible.builtin.set_fact:
+        vault_init: "{{ lookup('file', vault_init_file) | from_json }}"
+      no_log: true
+
+    - name: Re-read status after init
+      ansible.builtin.command: vault status -format=json
+      environment: "{{ vault_env }}"
+      register: st
+      changed_when: false
+      failed_when: st.rc == 1
+
+    - name: Unseal Vault
+      ansible.builtin.command: vault operator unseal {{ item }}
+      environment: "{{ vault_env }}"
+      loop: "{{ vault_init.unseal_keys_b64[:vault_key_threshold | int] }}"
+      when: (st.stdout | from_json).sealed
+      no_log: true
+
+    # ---------- Setup: KV v2 + smoke test ----------
+    - name: List secrets engines
+      ansible.builtin.command: vault secrets list -format=json
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': vault_init.root_token}) }}"
+      register: engines
+      changed_when: false
+      no_log: true
+
+    - name: Enable KV v2 at secret/
+      ansible.builtin.command: vault secrets enable -path=secret kv-v2
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': vault_init.root_token}) }}"
+      when: "'secret/' not in (engines.stdout | from_json)"
+      no_log: true
+
+    - name: Write and read back a test secret
+      ansible.builtin.shell: |
+        vault kv put secret/ansible-test hello=world >/dev/null
+        vault kv get -field=hello secret/ansible-test
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': vault_init.root_token}) }}"
+      register: kv_test
+      changed_when: false
+      no_log: true
+
+    # ---------- Verify ----------
+    - name: Final status
+      ansible.builtin.command: vault status -format=json
+      environment: "{{ vault_env }}"
+      register: st
+      changed_when: false
+      failed_when: st.rc == 1
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "URL         : {{ vault_env.VAULT_ADDR }}/ui"
+          - "Version     : {{ (st.stdout | from_json).version }}"
+          - "Initialized : {{ (st.stdout | from_json).initialized }}"
+          - "Sealed      : {{ (st.stdout | from_json).sealed }}"
+          - "Storage     : {{ (st.stdout | from_json).storage_type }}"
+          - "KV test     : {{ 'OK' if kv_test.stdout == 'world' else 'FAILED' }}"
+          - "Keys/token  : {{ vault_init_file }} on the controller"
+
+    - name: Fail if Vault is not ready
+      ansible.builtin.assert:
+        that:
+          - (st.stdout | from_json).initialized
+          - not (st.stdout | from_json).sealed
+          - kv_test.stdout == 'world'
+        fail_msg: "Vault is not initialised/unsealed, or the KV test failed"
+        success_msg: "Vault is initialised, unsealed and serving KV v2"
