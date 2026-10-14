@@ -1,0 +1,6 @@
+# Managed by Ansible (05_harden_vault.yml)
+# Lab "admin" policy: full access to every path, including sudo-protected ones
+# (needed for sys/ operations such as generate-root, audit, auth and policy management).
+path "*" {
+  capabilities = ["create", "read", "update", "patch", "delete", "list", "sudo"]
+}

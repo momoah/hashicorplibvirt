@@ -1,0 +1,183 @@
+---
+# Step 5: harden Vault - audit log, admin policy, userpass login, then revoke the root token.
+# Needs Vault unsealed (run 04 first). Safe to re-run.
+# Run:  ansible-playbook playbooks/05_harden_vault.yml
+
+- name: Harden Vault
+  hosts: vaultvms
+  become: true
+  vars:
+    vault_fqdn: "{{ inventory_hostname }}.{{ domain }}"
+    vault_env:
+      VAULT_ADDR: "https://{{ vault_fqdn }}:{{ vault_port }}"
+  tasks:
+    # ---------- Credentials from the controller ----------
+    - name: Load init file (root token)
+      ansible.builtin.set_fact:
+        vault_init: "{{ lookup('file', vault_init_file) | from_json }}"
+      no_log: true
+
+    - name: Load admin password from {{ vault_admin_password_file }}
+      ansible.builtin.set_fact:
+        vault_admin_password: "{{ lookup('file', vault_admin_password_file) }}"
+      no_log: true
+
+    - name: Check whether the root token is still valid
+      ansible.builtin.command: vault token lookup -format=json
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': vault_init.root_token}) }}"
+      register: root_lookup
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Log in as {{ vault_admin_user }} (used when root is already revoked)
+      ansible.builtin.command: vault write -field=token auth/userpass/login/{{ vault_admin_user }} password=-
+      args:
+        stdin: "{{ vault_admin_password }}"
+        stdin_add_newline: false
+      environment: "{{ vault_env }}"
+      register: admin_login_pre
+      changed_when: false
+      when: root_lookup.rc != 0
+      no_log: true
+
+    - name: Pick the working token (root on first run, admin afterwards)
+      ansible.builtin.set_fact:
+        work_token: "{{ vault_init.root_token if root_lookup.rc == 0 else admin_login_pre.stdout }}"
+      no_log: true
+
+    # ---------- 1. Audit log ----------
+    - name: Create audit log directory
+      ansible.builtin.file:
+        path: /var/log/vault
+        state: directory
+        owner: vault
+        group: vault
+        mode: "0750"
+
+    - name: List audit devices
+      ansible.builtin.command: vault audit list -format=json
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': work_token}) }}"
+      register: audits
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Enable file audit device
+      ansible.builtin.command: vault audit enable file file_path=/var/log/vault/vault_audit.log
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': work_token}) }}"
+      when: audits.stdout is not search('file/')
+      no_log: true
+
+    - name: Rotate the audit log weekly, keep 4 (copytruncate keeps Vault writing)
+      ansible.builtin.copy:
+        dest: /etc/logrotate.d/vault
+        mode: "0644"
+        content: |
+          /var/log/vault/vault_audit.log {
+              weekly
+              rotate 4
+              compress
+              missingok
+              notifempty
+              copytruncate
+          }
+
+    # ---------- 2. Admin policy ----------
+    - name: Copy admin policy to the VM
+      ansible.builtin.template:
+        src: ../templates/admin-policy.hcl.j2
+        dest: /etc/vault.d/admin-policy.hcl
+        owner: vault
+        group: vault
+        mode: "0640"
+
+    - name: Write admin policy into Vault
+      ansible.builtin.command: vault policy write admin /etc/vault.d/admin-policy.hcl
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': work_token}) }}"
+      changed_when: true
+      no_log: true
+
+    # ---------- 3. userpass login ----------
+    - name: List auth methods
+      ansible.builtin.command: vault auth list -format=json
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': work_token}) }}"
+      register: auths
+      changed_when: false
+      no_log: true
+
+    - name: Enable userpass auth
+      ansible.builtin.command: vault auth enable userpass
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': work_token}) }}"
+      when: "'userpass/' not in (auths.stdout | from_json)"
+      no_log: true
+
+    - name: Create/update user {{ vault_admin_user }} (password via stdin, never on the command line)
+      ansible.builtin.command: >
+        vault write auth/userpass/users/{{ vault_admin_user }}
+        password=- token_policies=admin token_ttl=8h token_max_ttl=24h
+      args:
+        stdin: "{{ vault_admin_password }}"
+        stdin_add_newline: false
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': work_token}) }}"
+      changed_when: true
+      no_log: true
+
+    - name: Prove the new login works
+      ansible.builtin.command: vault write -field=token auth/userpass/login/{{ vault_admin_user }} password=-
+      args:
+        stdin: "{{ vault_admin_password }}"
+        stdin_add_newline: false
+      environment: "{{ vault_env }}"
+      register: admin_login
+      changed_when: false
+      no_log: true
+
+    - name: Prove the admin token can write and read its own check secret
+      ansible.builtin.shell: |
+        vault kv put secret/ansible-harden-check ok=yes >/dev/null
+        vault kv get -field=ok secret/ansible-harden-check
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': admin_login.stdout}) }}"
+      register: admin_read
+      changed_when: false
+      failed_when: false
+
+    - name: Stop before revoking root if the admin login is not fully working
+      ansible.builtin.assert:
+        that: admin_read.stdout == 'yes'
+        fail_msg: "Admin write/read test failed - root token NOT revoked. rc={{ admin_read.rc }} stderr={{ admin_read.stderr }}"
+        success_msg: "Admin login works and can write/read secret/"
+
+    # ---------- 4. Revoke root ----------
+    - name: Revoke the initial root token
+      ansible.builtin.command: vault token revoke -self
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': vault_init.root_token}) }}"
+      when:
+        - vault_revoke_root | bool
+        - root_lookup.rc == 0
+      no_log: true
+
+    # ---------- Verify ----------
+    - name: Re-check root token
+      ansible.builtin.command: vault token lookup
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': vault_init.root_token}) }}"
+      register: root_after
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Re-check audit devices
+      ansible.builtin.command: vault audit list -format=json
+      environment: "{{ vault_env | combine({'VAULT_TOKEN': admin_login.stdout}) }}"
+      register: audits_after
+      changed_when: false
+      no_log: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Audit device : {{ 'file/ -> /var/log/vault/vault_audit.log' if audits_after.stdout is search('file/') else 'MISSING' }}"
+          - "Admin login  : {{ vault_admin_user }} (userpass) -> policy 'admin', token TTL 8h"
+          - "Admin read   : {{ 'OK' if admin_read.stdout == 'yes' else 'FAILED' }}"  
+          - "Root token   : {{ 'REVOKED' if root_after.rc != 0 else 'still valid' }}"
+

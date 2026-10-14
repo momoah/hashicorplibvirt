@@ -23,17 +23,17 @@ vault   IN A    192.168.1.220
 ```
 ansible-playbook playbooks/01_build_vm.yml        # Create the VM (virt-install + cloud-init seed ISO)
 ansible-playbook playbooks/02_rhel_updates.yml    # Register, pin release, enable repos, update, reboot if needed
-ansible-playbook playbooks/03_install_vault.yml   # HashiCorp repo + vault-{{ vault_version }}, version-locked
+ansible-playbook playbooks/03_install_vault.yml   # HashiCorp repo + pinned Vault, version-locked
 ansible-playbook playbooks/04_configure_vault.yml # Raft + TLS config, init, unseal, KV v2 at secret/
+ansible-playbook playbooks/05_harden_vault.yml    # Audit log, admin policy, userpass login, revoke root
 ansible-playbook playbooks/99_destroy_vm.yml      # Tear down the VM to rebuild
 ```
 
-After a VM reboot Vault starts sealed. Re-run `04_configure_vault.yml` to unseal it.
+After a VM reboot Vault starts sealed: re-run `04_configure_vault.yml` to unseal.
 
-Unseal key and root token: `~/vault-init.json` on the controller (mode 0600). Never commit it.
-
-Upgrade Vault: change `vault_version`, then remove the lock with
-`sudo dnf versionlock delete vault` on the VM and re-run 03.
+Controller files (mode 0600, never commit):
+- `~/vault-init.json` – unseal key (its root token is revoked by step 05)
+- `~/vault-admin-password` – password for the `admin` userpass login
 
 ## Author(s)
 

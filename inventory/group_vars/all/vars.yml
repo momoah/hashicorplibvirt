@@ -43,3 +43,11 @@ vault_key_threshold: 1
 # Unseal keys + root token are written here on the controller (never commit this file)
 vault_init_file: "{{ lookup('env', 'HOME') }}/vault-init.json"
 
+
+# --- Hardening (step 5) ---
+vault_admin_user: "admin"
+# Plain-text password file on the controller (mode 0600). Vault stores only a hash of it.
+vault_admin_password_file: "{{ lookup('env', 'HOME') }}/vault-admin-password"
+vault_revoke_root: true
+
+
